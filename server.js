@@ -131,6 +131,13 @@ const userSchema = new mongoose.Schema(
       unique: true,
       trim: true,
     },
+    email: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      unique: true,
+      sparse: true,
+    },
     passwordHash: {
       type: String,
       required: true,
@@ -183,6 +190,63 @@ const userSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+const khanPasswordResetSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+    username: {
+      type: String,
+      required: true,
+      trim: true,
+      lowercase: true,
+    },
+    email: {
+      type: String,
+      default: "",
+      trim: true,
+      lowercase: true,
+    },
+    requestRef: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+    },
+    ticketHash: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+    },
+    status: {
+      type: String,
+      enum: [
+        "pending",
+        "approved",
+        "rejected",
+        "completed",
+        "expired",
+        "locked",
+      ],
+      default: "pending",
+      index: true,
+    },
+    expiresAt: {
+      type: Date,
+      required: true,
+      index: true,
+    },
+    approvedAt: Date,
+    approvedBy: mongoose.Schema.Types.ObjectId,
+  },
+  { timestamps: true }
+);
+
 
 const customerSchema = new mongoose.Schema(
   {
@@ -297,6 +361,10 @@ const financeSchema = new mongoose.Schema(
 );
 
 const User = mongoose.model("User", userSchema);
+const KhanPasswordReset = mongoose.model(
+  "KhanPasswordReset",
+  khanPasswordResetSchema
+);
 const Customer = mongoose.model("Customer", customerSchema);
 const Transaction = mongoose.model("Transaction", transactionSchema);
 const Profile = mongoose.model("Profile", profileSchema);
@@ -315,6 +383,7 @@ function publicUser(user) {
   return {
     id: user._id,
     username: user.username,
+    email: user.email || "",
     role: user.role,
     monthlyFee: user.monthlyFee || 0,
     accountStatus: user.accountStatus || "approved",
@@ -518,6 +587,7 @@ function installPasswordRecovery(
   app,
   {
     User,
+    KhanPasswordReset,
     secret,
     authenticateToken,
     requireAdmin,
@@ -539,6 +609,10 @@ function installPasswordRecovery(
       typeof req.body?.username === "string"
         ? req.body.username.trim().slice(0, 100)
         : "",
+    email:
+      typeof req.body?.email === "string"
+        ? req.body.email.trim().toLowerCase().slice(0, 200)
+        : "",
     ticket:
       typeof req.body?.ticket === "string"
         ? req.body.ticket
@@ -546,10 +620,9 @@ function installPasswordRecovery(
   });
 
   const ticketQuery = (req) => {
-    const { username, ticket } = credentials(req);
+    const { ticket } = credentials(req);
 
     return {
-      username,
       role: "user",
       "passwordReset.ticketHash": ticketHash(ticket),
     };
@@ -698,54 +771,85 @@ function installPasswordRecovery(
   );
 
   // User password recovery requires admin approval.
+  // Username OR Email is accepted.
+  // Normal users use KhanPasswordReset collection.
+  // Admin keeps the separate private PIN recovery above.
   app.post(
     "/api/auth/forgot-password",
     ipLimit("forgot", 20, hour),
     wrap(async (req, res) => {
-      const { username } = credentials(req);
+      const { username, email } = credentials(req);
 
-      if (!username) {
-        return fail(res, 400, "USERNAME_REQUIRED");
+      if (!username && !email) {
+        return res.status(400).json({
+          code: "USERNAME_OR_EMAIL_REQUIRED",
+          message: "Enter your username or email.",
+        });
       }
+
+      let user = null;
+
+      if (username) {
+        user = await User.findOne({
+          username,
+          role: "user",
+        });
+      }
+
+      if (!user && email) {
+        user = await User.findOne({
+          email,
+          role: "user",
+        });
+      }
+
+      if (!user) {
+        return res.status(404).json({
+          code: "ACCOUNT_NOT_FOUND",
+          message:
+            "No Khan Easy Kahta account found with this username or email.",
+        });
+      }
+
+      const now = new Date();
+
+      // Close any older active request for this user.
+      await KhanPasswordReset.updateMany(
+        {
+          userId: user._id,
+          status: { $in: ["pending", "approved"] },
+        },
+        {
+          $set: { status: "expired" },
+        }
+      );
 
       const ticket = randomBytes(32).toString("hex");
       const requestRef = randomBytes(12).toString("hex");
-      const now = new Date();
-      const expiresAt = new Date(Date.now() + 24 * hour);
 
-      await User.findOneAndUpdate(
-          {
-            username,
-            role: "user",
-            $or: [
-              { "passwordReset.status": { $exists: false } },
-              {
-                "passwordReset.status": {
-                  $in: ["rejected", "completed", "locked"],
-                },
-              },
-              { "passwordReset.expiresAt": { $lte: now } },
-            ],
-          },
-          {
-            $set: {
-              passwordReset: {
-                requestRef,
-                ticketHash: ticketHash(ticket),
-                status: "pending",
-                requestedAt: now,
-                expiresAt,
-              },
-            },
-          },
-          { runValidators: true }
-        );
+      // Admin has two minutes to review this request.
+      const expiresAt = new Date(Date.now() + 2 * 60 * 1000);
+
+      const recovery = await KhanPasswordReset.create({
+        userId: user._id,
+        username: user.username,
+        email: user.email || "",
+        requestRef,
+        ticketHash: ticketHash(ticket),
+        status: "pending",
+        expiresAt,
+      });
 
       res.status(202).json({
         ticket,
-        requestRef,
-        expiresAt,
+        requestRef: recovery.requestRef,
+        requestId: recovery._id,
+        username: recovery.username,
+        email: recovery.email,
+        status: recovery.status,
+        expiresAt: recovery.expiresAt,
         code: "REQUEST_SUBMITTED",
+        message: "Password recovery request sent to admin.",
       });
     })
   );
@@ -760,21 +864,32 @@ function installPasswordRecovery(
         return fail(res, 400, "INVALID_REQUEST");
       }
 
-      const user = await User.findOne(ticketQuery(req))
-        .select("passwordReset.status passwordReset.expiresAt")
-        .lean();
+      const recovery = await KhanPasswordReset.findOne({
+        ticketHash: ticketHash(ticket),
+      });
 
-      const reset = user?.passwordReset;
+      if (!recovery) {
+        return res.json({
+          status: "pending",
+          expiresAt: null,
+        });
+      }
 
-      const status = !reset
-        ? "pending"
-        : reset.expiresAt <= new Date()
-          ? "expired"
-          : reset.status;
+      if (
+        recovery.expiresAt <= new Date() &&
+        !["completed", "rejected", "expired"].includes(recovery.status)
+      ) {
+        recovery.status = "expired";
+        await recovery.save();
+      }
 
       res.json({
-        status,
-        expiresAt: status === "approved" ? reset.expiresAt : null,
+        requestId: recovery._id,
+        requestRef: recovery.requestRef,
+        username: recovery.username,
+        email: recovery.email,
+        status: recovery.status,
+        expiresAt: recovery.expiresAt,
       });
     })
   );
@@ -794,41 +909,40 @@ function installPasswordRecovery(
         return fail(res, 400, "PASSWORD_REQUIRED");
       }
 
-      const query = {
-        ...ticketQuery(req),
-        "passwordReset.status": "approved",
-        "passwordReset.expiresAt": { $gt: new Date() },
-      };
+      const recovery = await KhanPasswordReset.findOne({
+        ticketHash: ticketHash(ticket),
+        status: "approved",
+        expiresAt: { $gt: new Date() },
+      });
 
-      const user = await User.findOne(query);
+      if (!recovery) {
+        return fail(res, 400, "RESET_INVALID");
+      }
+
+      const user = await User.findOne({
+        _id: recovery.userId,
+        role: "user",
+      });
 
       if (!user) {
-        return fail(res, 400, "RESET_INVALID");
+        return fail(res, 404, "ACCOUNT_NOT_FOUND");
       }
 
       const passwordHash = await bcrypt.hash(newPassword, 12);
 
-      const updated = await User.findOneAndUpdate(
-        {
-          ...query,
-          _id: user._id,
-          passwordHash: user.passwordHash,
-          "passwordReset.expiresAt": { $gt: new Date() },
-        },
-        {
-          $set: {
-            passwordHash,
-            "passwordReset.status": "completed",
-          },
-          $inc: { tokenVersion: 1 },
-        }
-      );
+      user.passwordHash = passwordHash;
+      user.tokenVersion = Number(user.tokenVersion || 0) + 1;
 
-      if (!updated) {
-        return fail(res, 400, "RESET_INVALID");
-      }
+      await user.save();
 
-      res.json({ code: "PASSWORD_UPDATED" });
+      recovery.status = "completed";
+      await recovery.save();
+
+      res.json({
+        code: "PASSWORD_UPDATED",
+        message:
+          "Password changed successfully. You can now log in.",
+      });
     })
   );
 
@@ -837,32 +951,36 @@ function installPasswordRecovery(
     authenticateToken,
     requireAdmin,
     wrap(async (_req, res) => {
-      const users = await User.find({
-        role: "user",
-        "passwordReset.requestedAt": {
+      const now = new Date();
+
+      await KhanPasswordReset.updateMany(
+        {
+          status: { $in: ["pending", "approved"] },
+          expiresAt: { $lte: now },
+        },
+        {
+          $set: { status: "expired" },
+        }
+      );
+
+      const requests = await KhanPasswordReset.find({
+        createdAt: {
           $gt: new Date(Date.now() - 7 * 24 * hour),
         },
       })
-        .select(
-          "username passwordReset.requestRef passwordReset.status passwordReset.requestedAt passwordReset.expiresAt"
-        )
-        .sort({ "passwordReset.requestedAt": -1 })
+        .sort({ createdAt: -1 })
         .limit(100)
         .lean();
 
       res.json(
-        users.map((user) => ({
-          requestRef: user.passwordReset.requestRef,
-          username: user.username,
-          status:
-            user.passwordReset.status === "completed" ||
-            user.passwordReset.status === "rejected"
-              ? user.passwordReset.status
-              : user.passwordReset.expiresAt <= new Date()
-                ? "expired"
-                : user.passwordReset.status,
-          requestedAt: user.passwordReset.requestedAt,
-          expiresAt: user.passwordReset.expiresAt,
+        requests.map((request) => ({
+          requestId: request._id,
+          requestRef: request.requestRef,
+          username: request.username,
+          email: request.email || "",
+          status: request.status,
+          requestedAt: request.createdAt,
+          expiresAt: request.expiresAt,
         }))
       );
     })
@@ -886,38 +1004,41 @@ function installPasswordRecovery(
 
       const now = new Date();
 
-      const update =
-        decision === "approved"
-          ? {
-              "passwordReset.status": "approved",
-              "passwordReset.approvedAt": now,
-              "passwordReset.approvedBy": req.user.userId,
-              "passwordReset.expiresAt": new Date(
-                Date.now() + 10 * 60 * 1000
-              ),
-            }
-          : { "passwordReset.status": "rejected" };
+      const recovery = await KhanPasswordReset.findOne({
+        requestRef: req.params.ref,
+        status: "pending",
+      });
 
-      const user = await User.findOneAndUpdate(
-        {
-          role: "user",
-          "passwordReset.requestRef": req.params.ref,
-          "passwordReset.status": "pending",
-          "passwordReset.expiresAt": { $gt: now },
-        },
-        { $set: update },
-        { new: true }
-      );
-
-      if (!user) {
+      if (!recovery) {
         return fail(res, 409, "REQUEST_CHANGED");
       }
+
+      if (recovery.expiresAt <= now) {
+        recovery.status = "expired";
+        await recovery.save();
+
+        return fail(res, 409, "REQUEST_EXPIRED");
+      }
+
+      if (decision === "approved") {
+        recovery.status = "approved";
+        recovery.approvedAt = now;
+        recovery.approvedBy = req.user.userId;
+      } else {
+        recovery.status = "rejected";
+      }
+
+      await recovery.save();
 
       res.json({
         code:
           decision === "approved"
             ? "REQUEST_APPROVED"
             : "REQUEST_REJECTED",
+        requestId: recovery._id,
+        requestRef: recovery.requestRef,
+        status: recovery.status,
+        expiresAt: recovery.expiresAt,
       });
     })
   );
@@ -939,11 +1060,30 @@ function installAccountRegistration(
           ? req.body.username.trim()
           : "";
 
+      const email =
+        typeof req.body?.email === "string"
+          ? req.body.email.trim().toLowerCase()
+          : "";
+
       const password = req.body?.password;
 
       if (!username) {
         return res.status(400).json({
           message: "Username is required.",
+        });
+      }
+
+      if (!email) {
+        return res.status(400).json({
+          message: "Email is required.",
+        });
+      }
+
+      const emailIsValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+      if (!emailIsValid) {
+        return res.status(400).json({
+          message: "Enter a valid email address.",
         });
       }
 
@@ -959,11 +1099,18 @@ function installAccountRegistration(
         });
       }
 
+      if (await User.exists({ email })) {
+        return res.status(409).json({
+          message: "This email is already registered.",
+        });
+      }
+
       const passwordHash = await bcrypt.hash(password, 12);
 
       try {
         await User.create({
           username,
+          email,
           passwordHash,
           role: "user",
           monthlyFee: 0,
@@ -972,13 +1119,16 @@ function installAccountRegistration(
       } catch (error) {
         if (error.code === 11000) {
           return res.status(409).json({
-            message: "This username is unavailable.",
+            message: "This username or email is already registered.",
           });
         }
         throw error;
       }
 
-      res.status(201).json({ status: "pending" });
+      res.status(201).json({
+        status: "pending",
+        message: "Account request sent to admin for approval.",
+      });
     })
   );
 
@@ -991,7 +1141,7 @@ function installAccountRegistration(
         role: "user",
         accountStatus: { $in: ["pending", "rejected"] },
       })
-        .select("username accountStatus createdAt monthlyFee")
+        .select("username email accountStatus createdAt monthlyFee")
         .sort({ createdAt: -1 })
         .lean();
 
@@ -999,6 +1149,7 @@ function installAccountRegistration(
         users.map((user) => ({
           id: String(user._id),
           username: user.username,
+          email: user.email || "",
           status: user.accountStatus,
           createdAt: user.createdAt,
         }))
@@ -1090,6 +1241,7 @@ app.get("/api/health", (_req, res) => {
 
 installPasswordRecovery(app, {
   User,
+  KhanPasswordReset,
   secret: JWT_SECRET,
   authenticateToken,
   requireAdmin,
@@ -1233,7 +1385,7 @@ app.get(
         { accountStatus: { $exists: false } },
       ],
     })
-      .select("username role monthlyFee createdAt accountStatus")
+      .select("username email role monthlyFee createdAt accountStatus")
       .sort({ createdAt: -1 });
 
     res.json(users.map(publicUser));
@@ -1245,6 +1397,7 @@ app.post(
   requireAdmin,
   wrap(async (req, res) => {
     const username = String(req.body.username || "").trim();
+    const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
     const monthlyFee = Number(req.body.monthlyFee);
 
@@ -1272,10 +1425,27 @@ app.post(
       });
     }
 
+    if (email) {
+      const emailIsValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+      if (!emailIsValid) {
+        return res.status(400).json({
+          message: "Enter a valid email address",
+        });
+      }
+
+      if (await User.exists({ email })) {
+        return res.status(409).json({
+          message: "This email is already registered",
+        });
+      }
+    }
+
     const passwordHash = await bcrypt.hash(password, 12);
 
     const user = await User.create({
       username,
+      ...(email ? { email } : {}),
       passwordHash,
       role: "user",
       monthlyFee,

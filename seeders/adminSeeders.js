@@ -41,6 +41,14 @@ const userSchema = new mongoose.Schema(
       trim: true,
     },
 
+    email: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      unique: true,
+      sparse: true,
+    },
+
     passwordHash: {
       type: String,
       required: true,
@@ -559,30 +567,80 @@ async function seedDatabase() {
         "Admin account created."
       );
     } else {
-      console.log(
-        "Admin account already exists."
-      );
+      const configuredPasswordMatches =
+        await bcrypt.compare(
+          ADMIN_PASSWORD,
+          admin.passwordHash
+        );
+
+      let adminChanged = false;
+
+      if (!configuredPasswordMatches) {
+        admin.passwordHash =
+          await bcrypt.hash(
+            ADMIN_PASSWORD,
+            12
+          );
+
+        admin.tokenVersion =
+          Number(
+            admin.tokenVersion || 0
+          ) + 1;
+
+        admin.adminRecovery =
+          undefined;
+
+        admin.passwordReset =
+          undefined;
+
+        adminChanged = true;
+      }
+
+      if (admin.role !== "admin") {
+        admin.role =
+          "admin";
+        adminChanged = true;
+      }
+
+      if (admin.accountStatus !== "approved") {
+        admin.accountStatus =
+          "approved";
+        adminChanged = true;
+      }
+
+      if (admin.monthlyFee !== 0) {
+        admin.monthlyFee =
+          0;
+        adminChanged = true;
+      }
+
+      if (adminChanged) {
+        await admin.save();
+
+        console.log(
+          "Existing admin account updated."
+        );
+      } else {
+        console.log(
+          "Admin account already exists and is correct."
+        );
+      }
     }
 
-    // Make sure configured admin is admin
-    if (
-      admin.role !== "admin"
-    ) {
-      admin.role =
-        "admin";
-
-      admin.accountStatus =
-        "approved";
-
-      admin.monthlyFee =
-        0;
-
-      await admin.save();
-
-      console.log(
-        "Admin role corrected."
-      );
-    }
+    // Keep only the configured account as admin.
+    await User.updateMany(
+      {
+        role: "admin",
+        _id: {
+          $ne: admin._id,
+        },
+      },
+      {
+        $set: {
+          role: "user",
+        },
+      }
+    );
 
     // =================================================
     // CREATE DEMO USER
@@ -612,6 +670,9 @@ async function seedDatabase() {
           username:
             demoUsername,
 
+          email:
+            "demo@khaneasykahta.com",
+
           passwordHash,
 
           role:
@@ -637,8 +698,60 @@ async function seedDatabase() {
         "Demo user created."
       );
     } else {
+      let demoChanged = false;
+
+      if (!demoUser.email) {
+        demoUser.email =
+          "demo@khaneasykahta.com";
+        demoChanged = true;
+      }
+
+      if (demoUser.role !== "user") {
+        demoUser.role = "user";
+        demoChanged = true;
+      }
+
+      if (demoUser.accountStatus !== "approved") {
+        demoUser.accountStatus =
+          "approved";
+        demoChanged = true;
+      }
+
+      if (demoChanged) {
+        await demoUser.save();
+
+        console.log(
+          "Demo user corrected and updated."
+        );
+      } else {
+        console.log(
+          "Demo user already exists."
+        );
+      }
+    }
+
+    const demoPasswordMatches =
+      await bcrypt.compare(
+        demoPassword,
+        demoUser.passwordHash
+      );
+
+    if (!demoPasswordMatches) {
+      demoUser.passwordHash =
+        await bcrypt.hash(
+          demoPassword,
+          12
+        );
+
+      demoUser.tokenVersion =
+        Number(
+          demoUser.tokenVersion || 0
+        ) + 1;
+
+      await demoUser.save();
+
       console.log(
-        "Demo user already exists."
+        "Demo password reset to demo123."
       );
     }
 
