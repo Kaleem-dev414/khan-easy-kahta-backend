@@ -115,7 +115,7 @@ const fail = (res, status, code) =>
 
 const validPassword = (value) =>
   typeof value === "string" &&
-  value.length > 0 &&
+  value.length >= 6 &&
   Buffer.byteLength(value, "utf8") <= 72;
 
 
@@ -443,14 +443,16 @@ async function subscriptionStatus(userId, role) {
     Payment.findOne({ ownerId: userId, month }).lean(),
   ]);
 
+  const monthlyFee = Number(user?.monthlyFee || 0);
   const approved = payment?.status === "approved";
+  const paymentRequired = monthlyFee > 0;
 
   return {
     month,
     day,
-    monthlyFee: user?.monthlyFee || 0,
-    gracePeriod: day <= 3 && !approved,
-    locked: day > 3 && !approved,
+    monthlyFee,
+    gracePeriod: paymentRequired && day <= 3 && !approved,
+    locked: paymentRequired && day > 3 && !approved,
     payment: payment || null,
   };
 }
@@ -1407,9 +1409,9 @@ app.post(
       });
     }
 
-    if (!password) {
+    if (!validPassword(password)) {
       return res.status(400).json({
-        message: "Password is required",
+        message: "Password must be at least 6 characters",
       });
     }
 
@@ -1540,9 +1542,7 @@ app.post(
       });
     }
 
-    const transactionId = String(
-      req.body.transactionId || ""
-    ).trim();
+    const transactionId = String(req.body.transactionId || "").trim();
 
     if (transactionId.length < 4) {
       return res.status(400).json({
@@ -1556,24 +1556,42 @@ app.post(
       .select("monthlyFee")
       .lean();
 
+    const monthlyFee = Number(user?.monthlyFee || 0);
+
+    if (monthlyFee <= 0) {
+      return res.status(400).json({
+        message: "This account does not require a monthly payment",
+      });
+    }
+
+    const existingPayment = await Payment.findOne({
+      ownerId: req.user.userId,
+      month,
+    });
+
+    if (existingPayment?.status === "approved") {
+      return res.status(409).json({
+        message: "This month's payment has already been approved",
+        payment: existingPayment,
+      });
+    }
+
     const payment = await Payment.findOneAndUpdate(
+      { ownerId: req.user.userId, month },
       {
-        ownerId: req.user.userId,
-        month,
-      },
-      {
-        ownerId: req.user.userId,
-        month,
-        amount: user?.monthlyFee || 0,
-        transactionId,
-        status: "pending",
-        reviewedAt: null,
-        reviewedBy: null,
+        $set: {
+          amount: monthlyFee,
+          transactionId,
+          status: "pending",
+          reviewedAt: null,
+          reviewedBy: null,
+        },
+        $setOnInsert: { ownerId: req.user.userId, month },
       },
       { new: true, upsert: true, runValidators: true }
     );
 
-    res.status(201).json(payment);
+    res.status(existingPayment ? 200 : 201).json(payment);
   })
 );
 
@@ -1855,41 +1873,88 @@ app.put(
   "/api/transactions/:id",
   wrap(async (req, res) => {
     const ownerId = req.user.userId;
+    const transactionId = Number(req.params.id);
     const customerId = Number(req.body.customerId);
+    const amount = Number(req.body.amount);
+    const type = req.body.type;
+    const date = req.body.date;
 
-    const customerExists = await Customer.exists({
-      id: customerId,
+    if (!Number.isFinite(transactionId)) {
+      return res.status(400).json({ message: "Invalid transaction ID" });
+    }
+
+    if (!Number.isFinite(customerId)) {
+      return res.status(400).json({ message: "Invalid customer" });
+    }
+
+    if (!["credit", "payment"].includes(type)) {
+      return res.status(400).json({ message: "Invalid transaction type" });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        message: "Amount must be greater than zero",
+      });
+    }
+
+    if (!date) {
+      return res.status(400).json({ message: "Transaction date is required" });
+    }
+
+    const existingTransaction = await Transaction.findOne({
+      id: transactionId,
       ownerId,
     });
 
+    if (!existingTransaction) {
+      return res.status(404).json({ message: "Transaction not found" });
+    }
+
+    const customerExists = await Customer.exists({ id: customerId, ownerId });
+
     if (!customerExists) {
-      return res.status(404).json({
-        message: "Customer not found",
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    const records = await Transaction.find({
+      customerId,
+      ownerId,
+      id: { $ne: transactionId },
+    }).lean();
+
+    let totalCredit = 0;
+    let totalPayment = 0;
+
+    for (const record of records) {
+      if (record.type === "credit") {
+        totalCredit += Number(record.amount) || 0;
+      } else if (record.type === "payment") {
+        totalPayment += Number(record.amount) || 0;
+      }
+    }
+
+    if (type === "credit") totalCredit += amount;
+    else totalPayment += amount;
+
+    if (totalPayment > totalCredit) {
+      const availableBalance = Math.max(
+        0,
+        totalCredit - (totalPayment - amount)
+      );
+
+      return res.status(400).json({
+        message: `Payment cannot be greater than Rs. ${availableBalance}`,
       });
     }
 
-    const transaction = await Transaction.findOneAndUpdate(
-      {
-        id: Number(req.params.id),
-        ownerId,
-      },
-      {
-        customerId,
-        type: req.body.type,
-        amount: Number(req.body.amount),
-        date: req.body.date,
-        note: String(req.body.note || "").trim(),
-      },
-      { new: true, runValidators: true }
-    );
+    existingTransaction.customerId = customerId;
+    existingTransaction.type = type;
+    existingTransaction.amount = amount;
+    existingTransaction.date = date;
+    existingTransaction.note = String(req.body.note || "").trim();
 
-    if (!transaction) {
-      return res.status(404).json({
-        message: "Transaction not found",
-      });
-    }
-
-    res.json(transaction);
+    await existingTransaction.save();
+    res.json(existingTransaction);
   })
 );
 
