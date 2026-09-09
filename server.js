@@ -63,6 +63,7 @@ if (!/^\d{6}$/.test(ADMIN_SECURITY_PIN)) {
 const allowedOrigins = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
+  "https://khan-easy-kahta-frontend.vercel.app/",
 
   // Add your real Khan Easy Kahta Vercel frontend URL here after deployment.
   // Example: "https://khan-easy-kahta.vercel.app",
