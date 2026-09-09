@@ -1,0 +1,14 @@
+{
+  "customers": [],
+  "transactions": [],
+  "profile": {},
+  "users": [
+    {
+      "id": 1787872739552,
+      "username": "Kaleem Ullah Khan Durrani",
+      "passwordHash": "$2b$12$4807k8GZB6Szg/mPbUj6f.wIr9509rLubBS97kXIrjCQfOCQ0Q8P6",
+      "role": "admin",
+      "createdAt": "2026-08-27T23:18:58.893Z"
+    }
+  ]
+}
