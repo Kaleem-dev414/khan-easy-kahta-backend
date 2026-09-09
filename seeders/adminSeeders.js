@@ -1,3 +1,5 @@
+// ORIGINAL PROJECT FILE: backend/seeders/adminSeeders.js
+
 // =====================================================
 // KHAN EASY KAHTA - COMPLETE DATABASE SEEDER
 // =====================================================
