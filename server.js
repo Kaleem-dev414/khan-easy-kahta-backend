@@ -268,6 +268,9 @@ const customerSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+customerSchema.index({ ownerId: 1, id: 1 });
+customerSchema.index({ ownerId: 1, name: 1 });
+
 const transactionSchema = new mongoose.Schema(
   {
     id: { type: Number, required: true, unique: true },
@@ -289,6 +292,9 @@ const transactionSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+transactionSchema.index({ ownerId: 1, customerId: 1, date: -1 });
+transactionSchema.index({ ownerId: 1, date: -1 });
 
 const profileSchema = new mongoose.Schema(
   {
@@ -362,6 +368,8 @@ const financeSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+financeSchema.index({ ownerId: 1, date: -1, createdAt: -1 });
 
 const User = mongoose.model("User", userSchema);
 const KhanPasswordReset = mongoose.model(
@@ -524,7 +532,7 @@ function createAuthentication(User, secret) {
     }
 
     const user = await User.findById(claims.userId)
-      .select("username role tokenVersion accountStatus")
+      .select("username role tokenVersion accountStatus monthlyFee")
       .lean();
 
     if (
@@ -546,6 +554,7 @@ function createAuthentication(User, secret) {
       username: user.username,
       role: user.role,
       tokenVersion: user.tokenVersion || 0,
+      monthlyFee: Number(user.monthlyFee || 0),
     };
 
     next();
@@ -564,12 +573,32 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+async function requestSubscriptionStatus(req) {
+  const { month, day } = billingPeriod();
+  if (req.user.role === "admin") {
+    return { month, day, monthlyFee: 0, locked: false, gracePeriod: false, payment: null };
+  }
+
+  const monthlyFee = Number(req.user.monthlyFee || 0);
+  if (monthlyFee <= 0) {
+    return { month, day, monthlyFee: 0, locked: false, gracePeriod: false, payment: null };
+  }
+
+  const payment = await Payment.findOne({ ownerId: req.user.userId, month }).lean();
+  const approved = payment?.status === "approved";
+  return {
+    month,
+    day,
+    monthlyFee,
+    gracePeriod: day <= 3 && !approved,
+    locked: day > 3 && !approved,
+    payment: payment || null,
+  };
+}
+
 async function requireActiveSubscription(req, res, next) {
   try {
-    const status = await subscriptionStatus(
-      req.user.userId,
-      req.user.role
-    );
+    const status = await requestSubscriptionStatus(req);
 
     if (status.locked) {
       return res.status(402).json({
@@ -1643,6 +1672,40 @@ app.put(
   })
 );
 
+// Fast account bootstrap: subscription + initial app data in one request.
+app.get(
+  "/api/bootstrap",
+  wrap(async (req, res) => {
+    const ownerId = req.user.userId;
+    const subscription = await requestSubscriptionStatus(req);
+
+    if (subscription.locked) {
+      return res.json({
+        subscription,
+        customers: [],
+        transactions: [],
+        profile: {},
+        finances: [],
+      });
+    }
+
+    const [customers, transactions, profile, finances] = await Promise.all([
+      Customer.find({ ownerId }).lean(),
+      Transaction.find({ ownerId }).lean(),
+      Profile.findOne({ ownerId }).lean(),
+      Finance.find({ ownerId }).sort({ date: -1, createdAt: -1 }).lean(),
+    ]);
+
+    res.json({
+      subscription,
+      customers,
+      transactions,
+      profile: profile || {},
+      finances,
+    });
+  })
+);
+
 // Business-data routes require an active subscription.
 // Admin accounts are always unlocked.
 app.use("/api", requireActiveSubscription);
@@ -1800,12 +1863,12 @@ app.post(
     const type = req.body.type;
     const date = req.body.date;
 
-    const customer = await Customer.findOne({
+    const customerExists = await Customer.exists({
       id: customerId,
       ownerId,
     });
 
-    if (!customer) {
+    if (!customerExists) {
       return res.status(404).json({
         message: "Customer not found",
       });
@@ -2099,7 +2162,12 @@ app.use((error, _req, res, _next) => {
 // =====================================================
 
 mongoose
-  .connect(MONGODB_URI)
+  .connect(MONGODB_URI, {
+    maxPoolSize: 20,
+    minPoolSize: 2,
+    maxIdleTimeMS: 60000,
+    serverSelectionTimeoutMS: 8000,
+  })
   .then(async () => {
     await ensureAdminUser();
 
@@ -2116,3 +2184,5 @@ mongoose
     console.error("Server could not start:", error.message);
     process.exit(1);
   });
+
+  // 2119
