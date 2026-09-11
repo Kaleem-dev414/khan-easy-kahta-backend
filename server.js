@@ -1347,7 +1347,9 @@ app.post(
       });
     }
 
-    res.json(createSession(user));
+    const session = createSession(user);
+    const bootstrap = await buildBootstrapForUser(user);
+    res.json({ ...session, bootstrap });
   })
 );
 
@@ -1398,7 +1400,9 @@ app.post(
       });
     }
 
-    res.json(createSession(user));
+    const session = createSession(user);
+    const bootstrap = await buildBootstrapForUser(user);
+    res.json({ ...session, bootstrap });
   })
 );
 
@@ -1672,37 +1676,47 @@ app.put(
   })
 );
 
+async function buildBootstrapForUser(user) {
+  const ownerId = String(user._id || user.userId);
+  const subscription = await requestSubscriptionStatus({
+    user: {
+      userId: ownerId,
+      role: user.role,
+      monthlyFee: Number(user.monthlyFee || 0),
+    },
+  });
+
+  if (subscription.locked) {
+    return {
+      subscription,
+      customers: [],
+      transactions: [],
+      profile: {},
+      finances: [],
+    };
+  }
+
+  const [customers, transactions, profile, finances] = await Promise.all([
+    Customer.find({ ownerId }).lean(),
+    Transaction.find({ ownerId }).lean(),
+    Profile.findOne({ ownerId }).lean(),
+    Finance.find({ ownerId }).sort({ date: -1, createdAt: -1 }).lean(),
+  ]);
+
+  return {
+    subscription,
+    customers,
+    transactions,
+    profile: profile || {},
+    finances,
+  };
+}
+
 // Fast account bootstrap: subscription + initial app data in one request.
 app.get(
   "/api/bootstrap",
   wrap(async (req, res) => {
-    const ownerId = req.user.userId;
-    const subscription = await requestSubscriptionStatus(req);
-
-    if (subscription.locked) {
-      return res.json({
-        subscription,
-        customers: [],
-        transactions: [],
-        profile: {},
-        finances: [],
-      });
-    }
-
-    const [customers, transactions, profile, finances] = await Promise.all([
-      Customer.find({ ownerId }).lean(),
-      Transaction.find({ ownerId }).lean(),
-      Profile.findOne({ ownerId }).lean(),
-      Finance.find({ ownerId }).sort({ date: -1, createdAt: -1 }).lean(),
-    ]);
-
-    res.json({
-      subscription,
-      customers,
-      transactions,
-      profile: profile || {},
-      finances,
-    });
+    res.json(await buildBootstrapForUser(req.user));
   })
 );
 
@@ -2184,5 +2198,4 @@ mongoose
     console.error("Server could not start:", error.message);
     process.exit(1);
   });
-
-  // 2119
+// 2188
