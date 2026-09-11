@@ -1829,34 +1829,10 @@ app.post(
       });
     }
 
-    if (type === "payment") {
-      const records = await Transaction.find({
-        customerId,
-        ownerId,
-      }).lean();
-
-      const credit = records
-        .filter((record) => record.type === "credit")
-        .reduce((total, record) => total + record.amount, 0);
-
-      const payment = records
-        .filter((record) => record.type === "payment")
-        .reduce((total, record) => total + record.amount, 0);
-
-      const balance = Math.max(0, credit - payment);
-
-      if (balance <= 0) {
-        return res.status(400).json({
-          message: "Customer has no pending balance",
-        });
-      }
-
-      if (amount > balance) {
-        return res.status(400).json({
-          message: `Payment cannot be greater than Rs. ${balance}`,
-        });
-      }
-    }
+    // Payments are allowed even when the customer balance is zero
+    // or already negative. This supports advance/extra payments.
+    // Balance rule used by the frontend/reporting:
+    // balance = totalCredit - totalPayment
 
     const transaction = await Transaction.create({
       id: createId(),
@@ -1919,36 +1895,9 @@ app.put(
       return res.status(404).json({ message: "Customer not found" });
     }
 
-    const records = await Transaction.find({
-      customerId,
-      ownerId,
-      id: { $ne: transactionId },
-    }).lean();
-
-    let totalCredit = 0;
-    let totalPayment = 0;
-
-    for (const record of records) {
-      if (record.type === "credit") {
-        totalCredit += Number(record.amount) || 0;
-      } else if (record.type === "payment") {
-        totalPayment += Number(record.amount) || 0;
-      }
-    }
-
-    if (type === "credit") totalCredit += amount;
-    else totalPayment += amount;
-
-    if (totalPayment > totalCredit) {
-      const availableBalance = Math.max(
-        0,
-        totalCredit - (totalPayment - amount)
-      );
-
-      return res.status(400).json({
-        message: `Payment cannot be greater than Rs. ${availableBalance}`,
-      });
-    }
+    // Do not block edited payment transactions when total payments
+    // become greater than total credit. A negative balance represents
+    // advance/extra payment received from the customer.
 
     existingTransaction.customerId = customerId;
     existingTransaction.type = type;
